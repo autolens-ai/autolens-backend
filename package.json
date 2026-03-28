@@ -1,0 +1,22 @@
+{
+  "name": "autolens-backend",
+  "version": "1.0.0",
+  "description": "AutoLens AI — Monetized backend with Stripe + credit system",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "stripe": "^14.21.0",
+    "better-sqlite3": "^9.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "node-fetch": "^3.3.2",
+    "uuid": "^9.0.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
