@@ -1,281 +1,168 @@
 /**
- * AutoLens AI — Monetized Backend
- * Stripe payments + credit tracking + Anthropic API proxy
+ * AutoLens AI — Backend (Whish Manual Payments)
  *
- * Endpoints:
- *   POST /api/checkout       Create Stripe checkout session
- *   POST /api/webhook        Stripe webhook (adds credits after payment)
- *   POST /api/credits        Check license key balance
- *   POST /api/scan           Car identification (costs 1 credit)
- *   POST /api/build          Build Lab spec (costs 1 credit)
+ *   POST /api/claim-trial     Free 5-credit trial (1 per IP)
+ *   POST /api/credits         Check key balance
+ *   POST /api/scan            Car scan (1 credit)
+ *   POST /api/build           Build spec (1 credit)
+ *   POST /api/admin/generate  Generate key (admin)
+ *   POST /api/admin/keys      List all keys (admin)
+ *   POST /api/admin/topup     Add credits to key (admin)
  */
 
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
-import Stripe from 'stripe';
 import Database from 'better-sqlite3';
-import { v4 as uuid } from 'uuid';
 
-/* ── CONFIG ─────────────────────────────── */
-const PORT         = process.env.PORT || 3000;
-const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:8080';
+const PORT          = process.env.PORT || 3000;
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
-const stripe       = new Stripe(process.env.STRIPE_SECRET_KEY);
-const WEBHOOK_SEC  = process.env.STRIPE_WEBHOOK_SECRET;
-const MODEL        = 'claude-sonnet-4-20250514';
+const ADMIN_PASS    = process.env.ADMIN_PASSWORD || 'change-me';
+const MODEL         = 'claude-sonnet-4-20250514';
 
-/* ── PACKAGES ───────────────────────────── */
-const PACKAGES = {
-  starter: { name: 'Starter Pack',   credits: 150,  price_usd: 499,  emoji: '🚗' },
-  pro:     { name: 'Pro Pack',        credits: 400,  price_usd: 999,  emoji: '🏎️' },
-  elite:   { name: 'Elite Pack',      credits: 1000, price_usd: 1999, emoji: '🏁' },
-};
-
-/* ── DATABASE ───────────────────────────── */
+/* ── DATABASE ── */
 const db = new Database('autolens.db');
-
 db.exec(`
   CREATE TABLE IF NOT EXISTS licenses (
     key        TEXT PRIMARY KEY,
     credits    INTEGER NOT NULL DEFAULT 0,
     scans_used INTEGER NOT NULL DEFAULT 0,
-    package    TEXT,
-    email      TEXT,
-    created_at TEXT DEFAULT (datetime('now')),
-    stripe_session TEXT
+    package    TEXT DEFAULT 'manual',
+    note       TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+  CREATE TABLE IF NOT EXISTS trials (
+    ip TEXT PRIMARY KEY,
+    claimed_at TEXT DEFAULT (datetime('now'))
   );
 `);
 
-const addCredits = db.prepare(
-  `INSERT INTO licenses (key, credits, scans_used, package, email, stripe_session)
-   VALUES (?, ?, 0, ?, ?, ?)
-   ON CONFLICT(key) DO UPDATE SET credits = credits + excluded.credits`
-);
-const getByKey      = db.prepare(`SELECT * FROM licenses WHERE key = ?`);
-const deductCredit  = db.prepare(`UPDATE licenses SET credits = credits - 1, scans_used = scans_used + 1 WHERE key = ? AND credits > 0`);
-const getBySession  = db.prepare(`SELECT key FROM licenses WHERE stripe_session = ?`);
+const q = {
+  insert:   db.prepare(`INSERT OR IGNORE INTO licenses (key,credits,package,note) VALUES (?,?,?,?)`),
+  getKey:   db.prepare(`SELECT * FROM licenses WHERE key=?`),
+  deduct:   db.prepare(`UPDATE licenses SET credits=credits-1,scans_used=scans_used+1 WHERE key=? AND credits>0`),
+  topup:    db.prepare(`UPDATE licenses SET credits=credits+? WHERE key=?`),
+  allKeys:  db.prepare(`SELECT key,credits,scans_used,package,note,created_at FROM licenses ORDER BY created_at DESC`),
+  getTrial: db.prepare(`SELECT ip FROM trials WHERE ip=?`),
+  addTrial: db.prepare(`INSERT OR IGNORE INTO trials (ip) VALUES (?)`),
+};
 
-/* ── EXPRESS ────────────────────────────── */
-const app = express();
+/* ── HELPERS ── */
+const genKey = () => {
+  const s = () => Math.random().toString(36).substring(2,6).toUpperCase();
+  return `AL-${s()}-${s()}-${s()}`;
+};
+const getIP = req =>
+  req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
 
-// CORS — only allow your frontend
-app.use(cors({
-  origin: [FRONTEND_URL, 'http://localhost:8080', 'http://127.0.0.1:8080'],
-  methods: ['GET', 'POST', 'OPTIONS'],
-}));
-
-// Raw body needed for Stripe webhook signature verification
-app.use('/api/webhook', express.raw({ type: 'application/json' }));
-app.use(express.json({ limit: '10mb' })); // large for base64 images
-
-/* ── HELPERS ────────────────────────────── */
-function genKey() {
-  // Format: AL-XXXX-XXXX-XXXX (easy to type/share)
-  const seg = () => Math.random().toString(36).substring(2, 6).toUpperCase();
-  return `AL-${seg()}-${seg()}-${seg()}`;
-}
-
-async function callClaude(messages, system = '') {
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
+async function callClaude(messages, system='') {
+  const r = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': ANTHROPIC_KEY,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({ model: MODEL, max_tokens: 1000, system, messages }),
+    headers: { 'Content-Type':'application/json', 'x-api-key':ANTHROPIC_KEY, 'anthropic-version':'2023-06-01' },
+    body: JSON.stringify({ model:MODEL, max_tokens:1000, system, messages }),
   });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.error?.message || `Anthropic error ${res.status}`);
-  }
-  const data = await res.json();
-  return data.content?.[0]?.text || '';
+  if (!r.ok) { const e=await r.json().catch(()=>({})); throw new Error(e.error?.message||`Anthropic ${r.status}`); }
+  return (await r.json()).content?.[0]?.text || '';
 }
 
-function requireKey(req, res, next) {
+const requireAdmin = (req,res,next) =>
+  req.body.adminPassword===ADMIN_PASS ? next() : res.status(401).json({error:'Wrong admin password'});
+
+const requireKey = (req,res,next) => {
   const { licenseKey } = req.body;
-  if (!licenseKey) return res.status(400).json({ error: 'licenseKey required' });
-  const row = getByKey.get(licenseKey);
-  if (!row) return res.status(401).json({ error: 'Invalid license key' });
-  if (row.credits <= 0) return res.status(402).json({ error: 'No credits remaining. Purchase more at autolensai.netlify.app' });
+  if (!licenseKey) return res.status(400).json({error:'licenseKey required'});
+  const row = q.getKey.get(licenseKey);
+  if (!row)          return res.status(401).json({error:'Invalid license key'});
+  if (row.credits<=0) return res.status(402).json({error:'NO_CREDITS'});
   req.license = row;
   next();
-}
+};
 
-/* ── ROUTES ─────────────────────────────── */
+/* ── APP ── */
+const app = express();
+app.use(cors({ origin:'*' }));
+app.use(express.json({ limit:'12mb' }));
 
-/** Health check */
-app.get('/health', (_, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
+app.get('/health', (_,res) => res.json({status:'ok'}));
 
-/**
- * POST /api/checkout
- * Body: { package: 'starter' | 'pro' | 'elite', email?: string }
- * Returns: { url } — Stripe checkout URL
- */
-app.post('/api/checkout', async (req, res) => {
-  const { package: pkg, email } = req.body;
-  if (!PACKAGES[pkg]) return res.status(400).json({ error: 'Invalid package' });
-
-  const pack = PACKAGES[pkg];
-  // Pre-generate the license key so we can embed it in metadata
-  const licenseKey = genKey();
-
-  try {
-    const session = await stripe.checkout.sessions.create({
-      payment_method_types: ['card'],
-      mode: 'payment',
-      customer_email: email || undefined,
-      line_items: [{
-        price_data: {
-          currency: 'usd',
-          product_data: {
-            name: `AutoLens AI — ${pack.name}`,
-            description: `${pack.credits} car scans. Your license key: ${licenseKey}`,
-            images: [], // add your logo URL here if you have one
-          },
-          unit_amount: pack.price_usd, // in cents
-        },
-        quantity: 1,
-      }],
-      metadata: {
-        licenseKey,
-        package: pkg,
-        credits: String(pack.credits),
-      },
-      success_url: `${FRONTEND_URL}/success.html?key=${licenseKey}&pkg=${pkg}`,
-      cancel_url:  `${FRONTEND_URL}?cancelled=1`,
-    });
-
-    // Reserve the key in DB (0 credits until webhook confirms payment)
-    addCredits.run(licenseKey, 0, pkg, email || null, session.id);
-
-    res.json({ url: session.url });
-  } catch (err) {
-    console.error('Stripe error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+/* FREE TRIAL — 1 per IP */
+app.post('/api/claim-trial', (req,res) => {
+  const ip = getIP(req);
+  if (q.getTrial.get(ip)) return res.status(409).json({error:'TRIAL_USED'});
+  const key = genKey();
+  q.insert.run(key, 5, 'trial', 'Free trial');
+  q.addTrial.run(ip);
+  res.json({ key, credits:5 });
 });
 
-/**
- * POST /api/webhook
- * Stripe sends payment confirmation here → add credits
- */
-app.post('/api/webhook', (req, res) => {
-  let event;
-  try {
-    event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], WEBHOOK_SEC);
-  } catch (err) {
-    console.error('Webhook signature failed:', err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
-
-  if (event.type === 'checkout.session.completed') {
-    const session = event.data.object;
-    const { licenseKey, credits } = session.metadata;
-    if (licenseKey && credits) {
-      addCredits.run(licenseKey, parseInt(credits), session.metadata.package, session.customer_email || null, session.id);
-      console.log(`✅ Payment confirmed — key ${licenseKey} +${credits} credits`);
-    }
-  }
-
-  res.json({ received: true });
-});
-
-/**
- * POST /api/credits
- * Body: { licenseKey }
- * Returns: { credits, scans_used, package }
- */
-app.post('/api/credits', (req, res) => {
+/* CHECK CREDITS */
+app.post('/api/credits', (req,res) => {
   const { licenseKey } = req.body;
-  if (!licenseKey) return res.status(400).json({ error: 'licenseKey required' });
-  const row = getByKey.get(licenseKey);
-  if (!row) return res.status(404).json({ error: 'Key not found' });
-  res.json({ credits: row.credits, scans_used: row.scans_used, package: row.package });
+  if (!licenseKey) return res.status(400).json({error:'licenseKey required'});
+  const row = q.getKey.get(licenseKey);
+  if (!row) return res.status(404).json({error:'Key not found'});
+  res.json({ credits:row.credits, scans_used:row.scans_used, package:row.package });
 });
 
-/**
- * POST /api/scan
- * Body: { licenseKey, imageBase64, mimeType }
- * Returns: car analysis JSON
- * Costs: 1 credit
- */
-app.post('/api/scan', requireKey, async (req, res) => {
+/* SCAN */
+app.post('/api/scan', requireKey, async (req,res) => {
   const { imageBase64, mimeType } = req.body;
-  if (!imageBase64 || !mimeType) return res.status(400).json({ error: 'imageBase64 and mimeType required' });
-
+  if (!imageBase64||!mimeType) return res.status(400).json({error:'imageBase64 and mimeType required'});
   try {
-    const txt = await callClaude([{
-      role: 'user',
-      content: [
-        { type: 'image', source: { type: 'base64', media_type: mimeType, data: imageBase64 } },
-        { type: 'text', text: `Analyze this car image. Return ONLY valid JSON, no markdown:
+    const txt = await callClaude([{ role:'user', content:[
+      { type:'image', source:{ type:'base64', media_type:mimeType, data:imageBase64 } },
+      { type:'text', text:`Analyze this car image. Return ONLY valid JSON, no markdown:
 {"isCar":true,"brand":"BMW","model":"M3","trim":"Competition xDrive","yearRange":"2021-2024","confidence":94,
 "specs":{"power":"503 hp","torque":"479 lb-ft","acceleration":"3.5s 0-60","topSpeed":"180 mph","drivetrain":"AWD","weight":"3,828 lbs"},
-"funFacts":["fact1","fact2","fact3"],
-"heritage":"One sentence about this car line's history.",
-"marketAnalysis":"2025 used market: pricing range, demand, investment outlook in 2 sentences.",
+"funFacts":["surprising fact 1","surprising fact 2","surprising fact 3"],
+"heritage":"One sentence about this model line history.",
+"marketAnalysis":"2025 used market pricing and demand in 2 sentences.",
 "upgradePaths":[
 {"stage":"Stage 1 — ECU & Air","description":"Software and intake, reversible.","expectedGain":"+45 hp","estimatedCost":"$1,200","keyParts":["ECU Tune","Cold Air Intake","Charge Pipe"]},
-{"stage":"Stage 2 — Fueling & Cooling","description":"Intercooler and fueling to support Stage 1.","expectedGain":"+100 hp","estimatedCost":"$5,000","keyParts":["FMIC","Injectors","Downpipe"]},
+{"stage":"Stage 2 — Fueling & Cooling","description":"Intercooler and fueling.","expectedGain":"+100 hp","estimatedCost":"$5,000","keyParts":["FMIC","Injectors","Downpipe"]},
 {"stage":"Stage 3 — Full Build","description":"Turbo and internals for max power.","expectedGain":"+250 hp","estimatedCost":"$18,000","keyParts":["Turbo Kit","Forged Internals","Full Fuel"]}
 ]}
 If not a car: {"isCar":false}` }
-      ]
-    }], 'You are an automotive expert. Return ONLY valid compact JSON.');
-
-    const data = JSON.parse(txt.replace(/```json|```/g, '').trim());
-
-    // Only deduct if we got a valid response
-    deductCredit.run(req.license.key);
-    const updated = getByKey.get(req.license.key);
-
-    res.json({ ...data, creditsRemaining: updated.credits });
-  } catch (err) {
-    console.error('Scan error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+    ]}], 'You are an automotive expert. Return ONLY valid compact JSON.');
+    const data = JSON.parse(txt.replace(/```json|```/g,'').trim());
+    q.deduct.run(req.license.key);
+    const updated = q.getKey.get(req.license.key);
+    res.json({ ...data, creditsRemaining:updated.credits });
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
-/**
- * POST /api/build
- * Body: { licenseKey, carName, request }
- * Returns: { spec: string }
- * Costs: 1 credit
- */
-app.post('/api/build', requireKey, async (req, res) => {
-  const { carName, request: buildRequest } = req.body;
-  if (!buildRequest) return res.status(400).json({ error: 'request required' });
-
+/* BUILD LAB */
+app.post('/api/build', requireKey, async (req,res) => {
+  const { carName, request:buildReq } = req.body;
+  if (!buildReq) return res.status(400).json({error:'request required'});
   try {
-    const spec = await callClaude([{
-      role: 'user',
-      content: `Car: ${carName || 'unspecified'}\nClient request: "${buildRequest}"\n\nWrite a detailed custom build spec: goals, specific parts with brand names, power targets, cost breakdown by category, build order, track vs street notes, pitfalls to avoid. ~400 words.`
+    const spec = await callClaude([{ role:'user', content:
+      `Car: ${carName||'unspecified'}\nRequest: "${buildReq}"\n\nWrite a detailed custom build spec: goals, specific parts with brand names, power targets, cost breakdown by category, build order, track vs street notes, pitfalls to avoid. ~400 words.`
     }], 'You are a world-class tuner. Be technical, specific, and direct.');
-
-    deductCredit.run(req.license.key);
-    const updated = getByKey.get(req.license.key);
-
-    res.json({ spec, creditsRemaining: updated.credits });
-  } catch (err) {
-    console.error('Build error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+    q.deduct.run(req.license.key);
+    const updated = q.getKey.get(req.license.key);
+    res.json({ spec, creditsRemaining:updated.credits });
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
-/* ── START ──────────────────────────────── */
-app.listen(PORT, () => {
-  console.log(`
-  ██████╗ ██╗   ██╗████████╗ ██████╗ ██╗     ███████╗███╗   ██╗███████╗
-  ██╔══██╗██║   ██║╚══██╔══╝██╔═══██╗██║     ██╔════╝████╗  ██║██╔════╝
-  ███████║██║   ██║   ██║   ██║   ██║██║     █████╗  ██╔██╗ ██║███████╗
-  ██╔══██║██║   ██║   ██║   ██║   ██║██║     ██╔══╝  ██║╚██╗██║╚════██║
-  ██║  ██║╚██████╔╝   ██║   ╚██████╔╝███████╗███████╗██║ ╚████║███████║
-  ╚═╝  ╚═╝ ╚═════╝    ╚═╝    ╚═════╝ ╚══════╝╚══════╝╚═╝  ╚═══╝╚══════╝
-
-  🚀 Server running on port ${PORT}
-  🌐 Allowing requests from: ${FRONTEND_URL}
-  `);
+/* ── ADMIN ── */
+app.post('/api/admin/generate', requireAdmin, (req,res) => {
+  const { credits=150, package:pkg='manual', note='' } = req.body;
+  const key = genKey();
+  q.insert.run(key, parseInt(credits), pkg, note);
+  res.json({ key, credits:parseInt(credits), package:pkg });
 });
+
+app.post('/api/admin/keys', requireAdmin, (req,res) => {
+  res.json({ keys:q.allKeys.all() });
+});
+
+app.post('/api/admin/topup', requireAdmin, (req,res) => {
+  const { licenseKey, credits } = req.body;
+  const row = q.getKey.get(licenseKey);
+  if (!row) return res.status(404).json({error:'Key not found'});
+  q.topup.run(parseInt(credits), licenseKey);
+  res.json({ key:licenseKey, credits:q.getKey.get(licenseKey).credits });
+});
+
+app.listen(PORT, () => console.log(`AutoLens backend running on port ${PORT}`));
