@@ -55,11 +55,11 @@ const genKey = () => {
 const getIP = req =>
   req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
 
-async function callClaude(messages, system='') {
+async function callClaude(messages, system='', maxTokens=1000) {
   const r = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'Content-Type':'application/json', 'x-api-key':ANTHROPIC_KEY, 'anthropic-version':'2023-06-01' },
-    body: JSON.stringify({ model:MODEL, max_tokens:1000, system, messages }),
+    body: JSON.stringify({ model:MODEL, max_tokens:maxTokens, system, messages }),
   });
   if (!r.ok) { const e=await r.json().catch(()=>({})); throw new Error(e.error?.message||`Anthropic ${r.status}`); }
   return (await r.json()).content?.[0]?.text || '';
@@ -138,7 +138,7 @@ app.post('/api/build', requireKey, async (req,res) => {
   try {
     const spec = await callClaude([{ role:'user', content:
       `Car: ${carName||'unspecified'}\nRequest: "${buildReq}"\n\nWrite a detailed custom build spec: goals, specific parts with brand names, power targets, cost breakdown by category, build order, track vs street notes, pitfalls to avoid. ~400 words.`
-    }], 'You are a world-class tuner. Be technical, specific, and direct.');
+    }], 'You are a world-class tuner. Be technical, specific, and direct.', 1800);
     q.deduct.run(req.license.key);
     const updated = q.getKey.get(req.license.key);
     res.json({ spec, creditsRemaining:updated.credits });
